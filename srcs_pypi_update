@@ -1,0 +1,239 @@
+#! /usr/bin/env nix-shell
+#! nix-shell -i python3 -p python35Packages.aiohttp python35Packages.toolz python35Packages.GitPython
+import asyncio
+import datetime
+import itertools
+import json
+import logging
+import os
+import tempfile
+from xmlrpc.client import ServerProxy
+
+import aiohttp
+import toolz
+from git import Repo
+
+
+FILENAME = "srcs.json"
+URL_REPO = "https://github.com/FRidh/srcs-pypi";
+
+#INDEX = "http://pypi.python.org/pypi"
+INDEX = "https://pypi.io/pypi"
+"""url of PyPI"""
+
+EXTENSIONS = ['tar.gz', 'tar.bz2', 'tar', 'zip', 'whl']
+"""Permitted file extensions. These are evaluated from left to right and the first occurance is returned."""
+
+def retrieve_available_packages(index=INDEX):
+    """Retrieve a list with available packages from the index.
+
+    :param index: url with packages index. By default `INDEX` is used.
+    :returns: List of packages.
+    """
+    with ServerProxy(index) as client:
+        return client.list_packages()
+
+
+def retrieve_packages_to_update(timestamp, index=INDEX):
+    """Obtain names of packages that have updated since we last checked PyPI.
+
+    :param timestamp: UTC timestamp.
+    :param index: url with packages index. By default `INDEX` is used.
+    :returns: List of packages.
+    """
+    with ServerProxy(index) as client:
+        # List of tuples with changes.
+        # The last change is the last item in the list.
+        # Tuple of (package name, version, timestamp, event)
+        # If changelog is passed True as second argument
+        # a fifth item is added, serial.
+        changes = client.changelog(timestamp)
+    timestamp_last_update = changes[-1][2]
+    packages = list(set([x[0] for x in changes]))
+    return packages, timestamp_last_update
+
+
+async def _fetch_page(session, url, sem):
+    """Fetch page asynchronously.
+
+    :param session: Session of client
+    :param url: Requested url
+    """
+    async with sem:
+        async with session.get(url) as response:
+            with aiohttp.Timeout(2):
+                async with session.get(url) as response:
+                    assert response.status == 200
+                    return await response.json()
+
+def retrieve_packages_json(packages):
+    """Yield JSON information obtained from PyPI index given an iterable of package names.
+
+    :param packages: Iterable of package names.
+    :param index: url with packages index. By default `INDEX` is used.
+    """
+    loop = asyncio.get_event_loop()
+    connector = aiohttp.TCPConnector(share_cookies=True, loop=loop)
+    with aiohttp.ClientSession(loop=loop, connector=connector) as session:
+        tasks = []
+        sem = asyncio.Semaphore(100)
+        for package in packages:
+            url = "{}/{}/json".format(INDEX, package)
+            tasks.append(asyncio.ensure_future(_fetch_page(session, url, sem)))
+        result = loop.run_until_complete(asyncio.gather(*tasks, loop=loop, return_exceptions=True))
+        logging.info("Finished retrieved JSON from PyPI")
+        yield from result
+    #loop.close()
+
+
+def generate_nix_data(packages, ignore_exceptions=True):
+    """Generate Nix data for use in Nixpkgs.
+
+    :param packages: Iterable with names of packages to to include.
+    :param ignore_exceptions: Continue generating JSON while encountering exceptions. Package that raised exception is discarded.
+    """
+    # Retrieve for each package the JSON from PyPI
+    raw_json = itertools.chain.from_iterable(map(retrieve_packages_json, toolz.partition_all(100, packages)))
+    #raw_json = retrieve_packages_json(packages)
+    # Remove None, in case the url could not be retrieved.
+    raw_json = filter(lambda x: isinstance(x, dict), raw_json)
+    # And extract for each the relevant Nix data
+    #yield from map(extract_relevant_nix_data, raw_json)
+    for package in raw_json:
+        try:
+            data = extract_relevant_nix_data(package)
+        except ValueError as e:
+            if ignore_exceptions:
+                logging.info("Ignoring exception: {}".format(str(e)))
+                continue
+            else:
+                raise e
+        yield data
+
+
+def extract_relevant_nix_data(json):
+    """Extract relevant Nix data from the JSON of a package obtained from PyPI.
+
+    :param json: JSON obtained from PyPI
+    :param version: Specific version of package or one of the following strings: ['release',]
+    """
+    def _extract_license(json):
+        """Extract license from JSON."""
+        return json['info']['license']
+
+    def _available_versions(json):
+        return json['releases'].keys()
+
+    def _extract_latest_version(json):
+        return json['info']['version']
+
+    def _get_src_and_hash(json, version, extensions):
+        """Obtain url and hash for a given version and list of allowable extensions."""
+        if not json['releases']:
+            msg = "Package {}: No releases available.".format(json['info']['name'])
+            raise ValueError(msg)
+        else:
+            # We use ['releases'] and not ['urls'] because we want to have the possibility for different version.
+            for possible_file in json['releases'][version]:
+                for extension in extensions:
+                    if possible_file['filename'].endswith(extension):
+                        src = {'url': str(possible_file['url']),
+                               'sha256': str(possible_file['digests']['sha256']),
+                                }
+                        return src
+            else:
+                msg = "Package {}: No release with valid file extension available.".format(json['info']['name'])
+                logging.info(msg)
+                return None
+                #raise ValueError(msg)
+
+    def _get_sources(json, extensions):
+        versions = _available_versions(json)
+        releases = {version: _get_src_and_hash(json, version, extensions) for version in versions}
+        releases = toolz.itemfilter(lambda x: x[1] is not None, releases)
+        return releases
+
+
+    name = str(json['info']['name'])
+    latest_version = str(_extract_latest_version(json))
+    #src = _get_src_and_hash(json, latest_version, EXTENSIONS)
+    sources = _get_sources(json, EXTENSIONS)
+
+    # Collect meta data
+    license = str(_extract_license(json))
+    license = license if license != "UNKNOWN" else None
+    summary = str(json['info'].get('summary')).strip('.')
+    summary = summary if summary != "UNKNOWN" else None
+    #description = str(json['info'].get('description'))
+    #description = description if description != "UNKNOWN" else None
+    homepage = json['info'].get('home_page')
+
+    data = {
+        'latest_version'    : latest_version,
+        'versions'  : sources,
+        #'src'           : src,
+        'meta'          : {
+            'description'            : summary if summary else None,
+            #'longDescription'        : description,
+            'license'                : license,
+            'homepage'               : homepage,
+            },
+        }
+    return name, data
+
+
+
+def main():
+    logging.basicConfig(filename='pypi2json.log', level=logging.DEBUG, filemode='w')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Clone repository from url into tmp folder.
+        repo = Repo.clone_from(URL_REPO, tmp)
+        # Check whether we update JSON file or create new one.
+        update = os.path.isfile(os.path.join(tmp, FILENAME))
+
+        print(os.listdir(tmp))
+        if update:
+            # Load old JSON file
+            with open(os.path.join(tmp, FILENAME), 'r') as fp:
+                old_json = json.load(fp)
+            # Retrieve packages we need to check
+            packages, timestamp = retrieve_packages_to_update(old_json['timestamp'])
+            data = generate_nix_data(packages)
+            # Unpack iterable of tuples into dict
+            data = {name: value for name, value in data}
+
+            # Update old data with new data
+            data = old_data.update(old_json['packages'])
+
+        else:
+            timestamp = datetime.datetime.now().timestamp()
+            packages = retrieve_available_packages()
+            data = generate_nix_data(packages)
+            # Unpack iterable of tuples into dict
+            data = {name: value for name, value in data}
+
+        #npackages = len(packages)
+        # Show a nice progressbar
+        #data = list(tqdm.tqdm(data, total=npackages))
+
+        # We need to keep the package data, but also the timestamp
+        data = {
+            'timestamp' : timestamp,
+            'packages'  : data,
+                }
+
+        # Write updated JSON to file
+        with open(os.path.join(tmp, FILENAME), 'w') as fp:
+            json.dump(data, fp, indent=2, sort_keys=True)
+
+        print(os.listdir(tmp))
+
+        # Add updated JSON file to staging and commit
+        repo.index.add([os.path.join(tmp, FILENAME)])
+        repo.index.commit('Update')
+        repo.remote().push()
+
+
+if __name__ == '__main__':
+    main()
