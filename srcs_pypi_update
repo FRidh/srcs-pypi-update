@@ -1,5 +1,5 @@
 #! /usr/bin/env nix-shell
-#! nix-shell -i python3 -p python35Packages.aiohttp python35Packages.toolz python35Packages.GitPython
+#! nix-shell -i python3 -p python35Packages.GitPython python35Packages.aiohttp python35Packages.toolz python35Packages.unidecode
 import asyncio
 import datetime
 import itertools
@@ -12,9 +12,8 @@ from xmlrpc.client import ServerProxy
 import aiohttp
 import toolz
 from git import Repo
+from unidecode import unidecode
 
-
-FILENAME = "srcs.json"
 URL_REPO = "https://github.com/FRidh/srcs-pypi";
 
 #INDEX = "http://pypi.python.org/pypi"
@@ -23,6 +22,29 @@ INDEX = "https://pypi.io/pypi"
 
 EXTENSIONS = ['tar.gz', 'tar.bz2', 'tar', 'zip', 'whl']
 """Permitted file extensions. These are evaluated from left to right and the first occurance is returned."""
+
+INCLUDE_NO_VERSIONS_AVAILABLE = False
+"""Whether to include the package when no versions are available. Could still be useful for the meta-data."""
+
+FOLDER_DATA = 'data'
+FILE_TIMESTAMP = os.path.join(FOLDER_DATA, "timestamp")
+
+logger = logging.getLogger(__name__)
+
+NSEMAPHORE = 200
+"""Maximum amount of concurrent requests"""
+
+NCHARACTERS = 1
+"""Group the packages on the first characters"""
+
+NTIMEOUT = 2
+"""Timeout in seconds"""
+
+def _file(package):
+    """Full path to file of `package`.
+    """
+    return os.path.join('data', package[0], "{}.json".format(package))
+
 
 def retrieve_available_packages(index=INDEX):
     """Retrieve a list with available packages from the index.
@@ -61,12 +83,36 @@ async def _fetch_page(session, url, sem):
     """
     async with sem:
         async with session.get(url) as response:
-            with aiohttp.Timeout(2):
+            with aiohttp.Timeout(NTIMEOUT):
                 async with session.get(url) as response:
                     assert response.status == 200
                     return await response.json()
 
-def retrieve_packages_json(packages):
+
+async def _write_package(folder, package, data):
+    """Write JSON to file."""
+    # We group files on first character of name.
+    first_characters = package[:NCHARACTERS]
+    if not os.path.exists(os.path.join(folder, first_characters)):
+        os.makedirs(os.path.join(folder, first_characters))
+
+    with open(os.path.join(folder, first_characters, "{}.json".format(package)), 'w') as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+async def _retrieve_and_write(session, semaphore, index, folder, package):
+    url = "{}/{}/json".format(index, package)
+    json = await _fetch_page(session, url, semaphore)
+    name, data = await extract_relevant_nix_data(json)
+    await _write_package(folder, package, data)
+    logger.debug("Finished with {}".format(package))
+
+async def _all(session, semaphore, index, folder, packages):
+    tasks = [ asyncio.ensure_future(_retrieve_and_write(session, semaphore, index, folder, package)) for package in packages]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return results
+
+
+def _get_and_write_data(folder, packages, index=INDEX):
     """Yield JSON information obtained from PyPI index given an iterable of package names.
 
     :param packages: Iterable of package names.
@@ -76,42 +122,18 @@ def retrieve_packages_json(packages):
     connector = aiohttp.TCPConnector(share_cookies=True, loop=loop)
     with aiohttp.ClientSession(loop=loop, connector=connector) as session:
         tasks = []
-        sem = asyncio.Semaphore(100)
-        for package in packages:
-            url = "{}/{}/json".format(INDEX, package)
-            tasks.append(asyncio.ensure_future(_fetch_page(session, url, sem)))
-        result = loop.run_until_complete(asyncio.gather(*tasks, loop=loop, return_exceptions=True))
-        logging.info("Finished retrieved JSON from PyPI")
-        yield from result
-    #loop.close()
+        sem = asyncio.Semaphore(NSEMAPHORE)
+        result = loop.run_until_complete(_all(session, sem, index, folder, packages))
+        logger.info("Finished retrieved JSON from PyPI")
+    loop.close()
 
 
-def generate_nix_data(packages, ignore_exceptions=True):
-    """Generate Nix data for use in Nixpkgs.
-
-    :param packages: Iterable with names of packages to to include.
-    :param ignore_exceptions: Continue generating JSON while encountering exceptions. Package that raised exception is discarded.
+def _clean_string(s):
+    """Clean string. Remove unicode characters.
     """
-    # Retrieve for each package the JSON from PyPI
-    raw_json = itertools.chain.from_iterable(map(retrieve_packages_json, toolz.partition_all(100, packages)))
-    #raw_json = retrieve_packages_json(packages)
-    # Remove None, in case the url could not be retrieved.
-    raw_json = filter(lambda x: isinstance(x, dict), raw_json)
-    # And extract for each the relevant Nix data
-    #yield from map(extract_relevant_nix_data, raw_json)
-    for package in raw_json:
-        try:
-            data = extract_relevant_nix_data(package)
-        except ValueError as e:
-            if ignore_exceptions:
-                logging.info("Ignoring exception: {}".format(str(e)))
-                continue
-            else:
-                raise e
-        yield data
+    return unidecode(s)
 
-
-def extract_relevant_nix_data(json):
+async def extract_relevant_nix_data(json):
     """Extract relevant Nix data from the JSON of a package obtained from PyPI.
 
     :param json: JSON obtained from PyPI
@@ -134,16 +156,16 @@ def extract_relevant_nix_data(json):
             raise ValueError(msg)
         else:
             # We use ['releases'] and not ['urls'] because we want to have the possibility for different version.
-            for possible_file in json['releases'][version]:
-                for extension in extensions:
+            for extension in extensions:
+                for possible_file in json['releases'][version]:
                     if possible_file['filename'].endswith(extension):
                         src = {'url': str(possible_file['url']),
                                'sha256': str(possible_file['digests']['sha256']),
                                 }
                         return src
             else:
-                msg = "Package {}: No release with valid file extension available.".format(json['info']['name'])
-                logging.info(msg)
+                msg = "Package {}: No release for version {} with valid file extension available.".format(json['info']['name'], version)
+                logger.info(msg)
                 return None
                 #raise ValueError(msg)
 
@@ -153,84 +175,69 @@ def extract_relevant_nix_data(json):
         releases = toolz.itemfilter(lambda x: x[1] is not None, releases)
         return releases
 
-
-    name = str(json['info']['name'])
+    name = _clean_string(str(json['info']['name']))
     latest_version = str(_extract_latest_version(json))
-    #src = _get_src_and_hash(json, latest_version, EXTENSIONS)
     sources = _get_sources(json, EXTENSIONS)
 
     # Collect meta data
-    license = str(_extract_license(json))
-    license = license if license != "UNKNOWN" else None
-    summary = str(json['info'].get('summary')).strip('.')
-    summary = summary if summary != "UNKNOWN" else None
-    #description = str(json['info'].get('description'))
-    #description = description if description != "UNKNOWN" else None
-    homepage = json['info'].get('home_page')
+    license = _clean_string(str(_extract_license(json)))
+    summary = _clean_string(str(json['info'].get('summary')).strip('.'))
+    homepage = _clean_string(str(json['info'].get('home_page')))
 
-    data = {
-        'latest_version'    : latest_version,
-        'versions'  : sources,
-        #'src'           : src,
-        'meta'          : {
-            'description'            : summary if summary else None,
-            #'longDescription'        : description,
-            'license'                : license,
-            'homepage'               : homepage,
-            },
-        }
+    meta = dict()
+    if license != "UNKNOWN":
+        meta['license'] = license
+
+    if summary != "UNKNOWN":
+        meta['description'] = summary
+
+    if homepage is not None:
+        meta['homepage'] = homepage
+
+    data = dict()
+    data['latest_version'] = latest_version,
+    data['versions'] = sources,
+    data['meta'] = meta
+
     return name, data
-
 
 
 def main():
     logging.basicConfig(filename='pypi2json.log', level=logging.DEBUG, filemode='w')
 
-    with tempfile.TemporaryDirectory() as tmp:
-        # Clone repository from url into tmp folder.
-        repo = Repo.clone_from(URL_REPO, tmp)
+    with tempfile.TemporaryDirectory() as folder:
+        # Clone repository from url into repo folder.
+        repo = Repo.clone_from(URL_REPO, folder)
+
+        if not os.path.exists(os.path.join(folder, FOLDER_DATA)):
+            os.makedirs(os.path.join(folder, FOLDER_DATA))
+
         # Check whether we update JSON file or create new one.
-        update = os.path.isfile(os.path.join(tmp, FILENAME))
+        update = os.path.isfile(os.path.join(folder, FILE_TIMESTAMP))
 
-        print(os.listdir(tmp))
+        # Obtain list of packages to update/retrieve
         if update:
-            # Load old JSON file
-            with open(os.path.join(tmp, FILENAME), 'r') as fp:
-                old_json = json.load(fp)
-            # Retrieve packages we need to check
-            packages, timestamp = retrieve_packages_to_update(old_json['timestamp'])
-            data = generate_nix_data(packages)
-            # Unpack iterable of tuples into dict
-            data = {name: value for name, value in data}
-
-            # Update old data with new data
-            data = old_data.update(old_json['packages'])
-
+            with open(os.path.join(folder, FILE_TIMESTAMP), 'r') as f:
+                timestamp = float(f.readline())
+            packages, timestamp = retrieve_packages_to_update(timestamp)
         else:
-            timestamp = datetime.datetime.now().timestamp()
             packages = retrieve_available_packages()
-            data = generate_nix_data(packages)
-            # Unpack iterable of tuples into dict
-            data = {name: value for name, value in data}
+            timestamp = datetime.datetime.now().timestamp()
 
-        #npackages = len(packages)
-        # Show a nice progressbar
-        #data = list(tqdm.tqdm(data, total=npackages))
+        with open(os.path.join(folder, FILE_TIMESTAMP), 'w') as f:
+            f.write(str(timestamp))
 
-        # We need to keep the package data, but also the timestamp
-        data = {
-            'timestamp' : timestamp,
-            'packages'  : data,
-                }
+        npackages = len(packages)
+        logging.info("Updating {} packages.".format(npackages))
 
-        # Write updated JSON to file
-        with open(os.path.join(tmp, FILENAME), 'w') as fp:
-            json.dump(data, fp, indent=2, sort_keys=True)
+        # Get data of each package and write to file
+        _get_and_write_data(os.path.join(folder, FOLDER_DATA), packages)
 
-        print(os.listdir(tmp))
+        print(os.listdir(os.path.join(folder, FOLDER_DATA)))
+
 
         # Add updated JSON file to staging and commit
-        repo.index.add([os.path.join(tmp, FILENAME)])
+        repo.index.add([os.path.join(folder, FOLDER_DATA)])
         repo.index.commit('Update')
         repo.remote().push()
 
