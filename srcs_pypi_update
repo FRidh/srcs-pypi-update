@@ -196,7 +196,7 @@ async def extract_relevant_nix_data(json):
 
     data = dict()
     data['latest_version'] = latest_version,
-    data['versions'] = sources,
+    data['versions'] = sources
     data['meta'] = meta
 
     return name, data
